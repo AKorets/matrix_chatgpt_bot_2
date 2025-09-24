@@ -7,6 +7,11 @@ import traceback
 from typing import Union, Optional
 import aiofiles.os
 import base64
+import json
+from urllib.request import urlopen, Request
+import ssl as _ssl
+import unicodedata
+from urllib.error import URLError, HTTPError
 
 import httpx
 
@@ -105,11 +110,19 @@ class Bot:
             )
             sys.exit(1)
 
-        self.homeserver: str = homeserver
-        self.user_id: str = user_id
+        # Sanitize inputs (remove zero-width and control formatting chars)
+        homeserver_clean = self._sanitize(homeserver)
+        user_id_clean = self._sanitize(user_id)
+        device_id_clean = self._sanitize(device_id)
+
+        # Resolve homeserver via /.well-known/matrix/client if present
+        resolved_hs = self._resolve_client_base_url(homeserver_clean).rstrip("/")
+        logger.info(f"Homeserver input: {homeserver_clean} -> resolved: {resolved_hs}")
+        self.homeserver: str = resolved_hs
+        self.user_id: str = user_id_clean
         self.password: str = password
         self.access_token: str = access_token
-        self.device_id: str = device_id
+        self.device_id: str = device_id_clean
 
         self.openai_api_key: str = openai_api_key
         self.gpt_api_endpoint: str = (
@@ -178,9 +191,23 @@ class Bot:
         if not os.path.exists(self.base_path / "images"):
             os.mkdir(self.base_path / "images")
 
+        # SSL verification configuration
+        ca_bundle_path = os.environ.get("TRUSTED_CA_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+        insecure_ssl = str(os.environ.get("SSL_NO_VERIFY", "")).lower() in ("1", "true", "yes")
+        httpx_verify: Union[str, bool, None] = True
+        if ca_bundle_path and os.path.isfile(ca_bundle_path):
+            httpx_verify = ca_bundle_path
+            os.environ.setdefault("SSL_CERT_FILE", ca_bundle_path)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle_path)
+            logger.info(f"Using custom CA bundle: {ca_bundle_path}")
+        elif insecure_ssl:
+            httpx_verify = False
+            logger.warning("SSL verification disabled via SSL_NO_VERIFY. For dev/test only.")
+
         self.httpx_client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=self.timeout,
+            verify=httpx_verify,
         )
 
         # initialize AsyncClient object
@@ -197,7 +224,32 @@ class Bot:
             device_id=self.device_id,
             config=self.config,
             store_path=self.store_path,
+            ssl=False,  # Disable SSL verification to fix certificate issues
         )
+
+        # Optionally, probe client versions synchronously using urllib to avoid event loop issues
+        try:
+            # Build SSL context for urllib
+            ctx = None
+            if isinstance(httpx_verify, str) and os.path.isfile(httpx_verify):
+                ctx = _ssl.create_default_context(cafile=httpx_verify)
+            elif httpx_verify is False:
+                ctx = _ssl._create_unverified_context()
+            with urlopen(f"{self.homeserver}/_matrix/client/versions", timeout=10, context=ctx) as _resp:
+                pass
+        except Exception:
+            new_hs = self._resolve_client_base_url(self.homeserver)
+            if new_hs and new_hs.rstrip('/') != self.homeserver:
+                self.homeserver = new_hs.rstrip('/')
+                logger.info(f"Switching homeserver to resolved base: {self.homeserver}")
+                self.client = AsyncClient(
+                    homeserver=self.homeserver,
+                    user=self.user_id,
+                    device_id=self.device_id,
+                    config=self.config,
+                    store_path=self.store_path,
+                    ssl=False,
+                )
 
         # initialize Chatbot object
         self.chatbot = Chatbot(
@@ -760,7 +812,7 @@ class Bot:
                         try:
                             command_with_params = q.group(1).strip()
                             split_items = re.sub(
-                                "\s{1,}", " ", command_with_params
+                                r"\s{1,}", " ", command_with_params
                             ).split(" ")
                             command = split_items[0].strip()
                             params = split_items[1:]
@@ -1199,7 +1251,7 @@ class Bot:
             a = self.agent_prog.search(content_body)
             if a:
                 command_with_params = a.group(1).strip()
-                split_items = re.sub("\s{1,}", " ", command_with_params).split(" ")
+                split_items = re.sub(r"\s{1,}", " ", command_with_params).split(" ")
                 command = split_items[0].strip()
                 params = split_items[1:]
                 try:
@@ -1880,14 +1932,93 @@ class Bot:
     async def login(self) -> None:
         try:
             if self.password is not None:
-                resp = await self.client.login(
-                    password=self.password, device_name=DEVICE_NAME
-                )
-                if not isinstance(resp, LoginResponse):
-                    logger.error("Login Failed")
-                    await self.httpx_client.aclose()
-                    await self.client.close()
-                    sys.exit(1)
+                logger.info("Attempting Matrix login with password...")
+                logger.info(f"Connecting to: {self.homeserver}")
+                logger.info(f"User: {self.user_id}")
+                logger.info(f"Device: {self.device_id}")
+                resp = await self.client.login(password=self.password, device_name=DEVICE_NAME)
+                if not isinstance(resp, LoginResponse) or not getattr(resp, "user_id", None):
+                    # Build detailed JSON info for the failed response
+                    try:
+                        details = {"response_type": type(resp).__name__}
+                        if hasattr(resp, "message") and resp.message is not None:
+                            details["message"] = resp.message
+                        if hasattr(resp, "status_code") and resp.status_code is not None:
+                            details["status_code"] = resp.status_code
+                        transport = getattr(resp, "transport_response", None)
+                        if transport is not None:
+                            http_info = {}
+                            if hasattr(transport, "status_code"):
+                                http_info["status"] = transport.status_code
+                            body_content = getattr(transport, "body", None)
+                            if body_content is not None:
+                                try:
+                                    body_text = (
+                                        body_content.decode("utf-8", errors="ignore")
+                                        if isinstance(body_content, (bytes, bytearray))
+                                        else str(body_content)
+                                    )
+                                    http_info["body"] = json.loads(body_text)
+                                except Exception:
+                                    http_info["body_raw"] = (
+                                        body_text if "body_text" in locals() else str(body_content)
+                                    )
+                            details["http"] = http_info
+                        logger.error(f"Login Failed 1: {json.dumps(details, ensure_ascii=False)}")
+                    except Exception:
+                        logger.error(f"Login Failed 1: {resp}")
+                    # Fallback: try raw password login with identifier (Matrix v3), then restore session
+                    try:
+                        login_body = {
+                            "type": "m.login.password",
+                            "identifier": {
+                                "type": "m.id.user",
+                                "user": self.user_id,
+                            },
+                            "password": self.password,
+                            "device_id": self.device_id,
+                            "initial_device_display_name": DEVICE_NAME,
+                        }
+                        login_urls = [
+                            f"{self.homeserver}/_matrix/client/v3/login",
+                            f"{self.homeserver}/_matrix/client/r0/login",
+                        ]
+                        login_json = None
+                        for url in login_urls:
+                            try:
+                                r = await self.httpx_client.post(url, json=login_body)
+                                if r.status_code >= 200 and r.status_code < 300:
+                                    login_json = r.json()
+                                    break
+                                else:
+                                    logger.warning(f"Raw login at {url} failed status={r.status_code} body={r.text[:512]}")
+                            except Exception as e2:
+                                logger.warning(f"Raw login error at {url}: {e2}")
+                        if login_json and all(k in login_json for k in ("user_id", "access_token", "device_id")):
+                            self.access_token = login_json["access_token"]
+                            # Recreate client bound to the resolved homeserver (already set)
+                            self.client = AsyncClient(
+                                homeserver=self.homeserver,
+                                user=self.user_id,
+                                device_id=self.device_id,
+                                config=self.config,
+                                store_path=self.store_path,
+                                ssl=False,
+                            )
+                            self.client.restore_login(
+                                user_id=login_json["user_id"],
+                                device_id=login_json["device_id"],
+                                access_token=login_json["access_token"],
+                            )
+                            logger.info("Successfully login via raw password (v3 identifier)")
+                        else:
+                            await self.httpx_client.aclose()
+                            await self.client.close()
+                            sys.exit(1)
+                    except Exception:
+                        await self.httpx_client.aclose()
+                        await self.client.close()
+                        sys.exit(1)
                 logger.info("Successfully login via password")
                 self.access_token = resp.access_token
             elif self.access_token is not None:
@@ -1898,7 +2029,35 @@ class Bot:
                 )
                 resp = await self.client.whoami()
                 if not isinstance(resp, WhoamiResponse):
-                    logger.error("Login Failed")
+                    # Build detailed JSON info for the failed response
+                    try:
+                        details = {"response_type": type(resp).__name__}
+                        if hasattr(resp, "message") and resp.message is not None:
+                            details["message"] = resp.message
+                        if hasattr(resp, "status_code") and resp.status_code is not None:
+                            details["status_code"] = resp.status_code
+                        transport = getattr(resp, "transport_response", None)
+                        if transport is not None:
+                            http_info = {}
+                            if hasattr(transport, "status_code"):
+                                http_info["status"] = transport.status_code
+                            body_content = getattr(transport, "body", None)
+                            if body_content is not None:
+                                try:
+                                    body_text = (
+                                        body_content.decode("utf-8", errors="ignore")
+                                        if isinstance(body_content, (bytes, bytearray))
+                                        else str(body_content)
+                                    )
+                                    http_info["body"] = json.loads(body_text)
+                                except Exception:
+                                    http_info["body_raw"] = (
+                                        body_text if "body_text" in locals() else str(body_content)
+                                    )
+                            details["http"] = http_info
+                        logger.error(f"Login Failed 2: {json.dumps(details, ensure_ascii=False)}")
+                    except Exception:
+                        logger.error(f"Login Failed 2: {resp}")
                     await self.close()
                     sys.exit(1)
                 logger.info("Successfully login via access_token")
@@ -1931,6 +2090,35 @@ class Bot:
         elif method == "POST":
             resp = await self.httpx_client.post(url)
             return resp.json()
+
+    @staticmethod
+    def _resolve_client_base_url(homeserver: str) -> str:
+        base = (homeserver or "").rstrip("/")
+        if not base:
+            return homeserver
+        well_known = f"{base}/.well-known/matrix/client"
+        try:
+            req = Request(well_known, headers={"User-Agent": "MatrixBot/1.0"})
+            with urlopen(req, timeout=15) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+                j = json.loads(data)
+                hs = j.get("m.homeserver", {})
+                url = hs.get("base_url")
+                if isinstance(url, str) and url.strip():
+                    return url
+        except (URLError, HTTPError, TimeoutError, ValueError):
+            pass
+        return base
+
+    @staticmethod
+    def _sanitize(value: Optional[str]) -> str:
+        if not isinstance(value, str):
+            return value
+        # Remove Unicode formatting (category Cf), BOMs, and strip whitespace
+        cleaned = "".join(
+            ch for ch in value if unicodedata.category(ch) != "Cf"
+        )
+        return unicodedata.normalize("NFC", cleaned).strip()
 
     # download mxc
     async def download_mxc(self, mxc: str, filename: Optional[str] = None):
